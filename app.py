@@ -129,9 +129,9 @@ def ingest():
     #    TODO: Replace the right-side strings ("12","13",...) with YOUR real field IDs from Jotform.
     #    Finding field IDs: open your Intake Form → click a field → Properties (gear) → Advanced → Field Details → "Field ID".
     Q = {
-      "transaction_type": "12",
-      "agent_role":       "13",
-      "purchase_price":   "15",
+      "transaction_type": "TransactionType",
+      "agent_role":       "AgencyType",
+      "purchase_price":   "PurchasePrice",
       "commission_rate":  "16",
       "buyer_name":       "17",
       "seller_name":      "18",
