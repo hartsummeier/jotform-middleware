@@ -140,13 +140,26 @@ def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
 
 def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
     """
-    Call Responses API with structured outputs.
-    NOTE: API now requires `text.format.name` in addition to `type` and `json_schema`.
+    Call the Responses API with structured outputs.
+    The schema must be under text.format.schema (not json_schema).
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing.")
 
+    # 1) Upload the PDF to the Files API
     file_id = openai_upload_file(pdf_bytes)
+
+    # 2) Build the format block exactly how the API expects it
+    format_block = {
+        "type": "json_schema",
+        # name is required per the API error you saw earlier
+        "name": schema_obj.get("name", "intake_extract"),
+        # schema must be the pure JSON Schema object
+        # Our make_json_schema() returns {"name","schema","strict"}, so use the inner "schema"
+        "schema": schema_obj.get("schema", schema_obj),
+        # strict is allowed here; defaults to True if present in your object
+        "strict": schema_obj.get("strict", True),
+    }
 
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
@@ -167,14 +180,7 @@ def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
                 {"type": "input_file", "file_id": file_id}
             ]
         }],
-        # ✅ Correct placement AND required name
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": schema_obj.get("name", "intake_extract"),
-                "json_schema": schema_obj
-            }
-        },
+        "text": { "format": format_block },
         "temperature": 0
     }
 
