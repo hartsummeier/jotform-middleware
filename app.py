@@ -26,6 +26,22 @@ def download_file(url):
     data = r.content
     return data, hashlib.sha256(data).hexdigest()
 
+def openai_upload_file(pdf_bytes, filename="contract.pdf"):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing.")
+    url = "https://api.openai.com/v1/files"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    files = {
+        "file": (filename, pdf_bytes, "application/pdf")
+    }
+    data = {"purpose": "assistants"}  # works with the Responses API too
+    r = requests.post(url, headers=headers, files=files, data=data, timeout=180)
+    try:
+        r.raise_for_status()
+    except Exception:
+        raise RuntimeError(f"OpenAI file upload error: {r.status_code} {r.text[:400]}")
+    return r.json()["id"]
+
 def make_json_schema(cfg_fields):
     """Build OpenAI JSON schema based on types in fields.json.
        Defaults to string if unknown."""
@@ -88,7 +104,10 @@ def make_json_schema(cfg_fields):
     }
 
 def extract_with_openai(pdf_bytes, schema):
-    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    # 1) Upload file once
+    file_id = openai_upload_file(pdf_bytes)
+
+    # 2) Ask the model to read that file and return strict JSON
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
@@ -97,17 +116,21 @@ def extract_with_openai(pdf_bytes, schema):
         "role":"user",
         "content":[
           {"type":"input_text","text":
-           "Read this real estate contract. Extract the fields defined by the schema. "
+           "Read this real estate purchase contract. Extract the fields defined by the schema. "
            "Return null for anything not present. Keep dates as YYYY-MM-DD if possible. "
            "For names and addresses, fill sub-fields if available. "
            "Also include page_refs for where you found key values and an overall confidence (0-1)."},
-          {"type":"input_image","image_url": f"data:application/pdf;base64,{b64}"}
+          {"type":"input_file","file_id": file_id}
         ]
       }],
       "response_format": {"type":"json_schema","json_schema": schema}
     }
     r = requests.post(url, headers=headers, json=payload, timeout=180)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except Exception:
+        # Surface the real error in logs or back to Zapier
+        raise RuntimeError(f"OpenAI API error: {r.status_code} {r.text[:400]}")
     data = r.json()
     parsed = data.get("output_parsed")
     if not parsed:
