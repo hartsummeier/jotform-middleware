@@ -73,10 +73,10 @@ def make_json_schema(cfg_fields: list) -> dict:
             props[key] = {
                 "type": "object", "nullable": True,
                 "properties": {
-                    "first": {"type": "string", "nullable": True},
-                    "last":  {"type": "string", "nullable": True},
-                    "middle":{"type": "string", "nullable": True},
-                    "suffix":{"type": "string", "nullable": True}
+                    "first":  {"type": "string", "nullable": True},
+                    "last":   {"type": "string", "nullable": True},
+                    "middle": {"type": "string", "nullable": True},
+                    "suffix": {"type": "string", "nullable": True}
                 },
                 "additionalProperties": False
             }
@@ -111,13 +111,15 @@ def make_json_schema(cfg_fields: list) -> dict:
     props["confidence"] = {"type": "number", "minimum": 0, "maximum": 1, "nullable": True}
     props["page_refs"]  = {"type": "array", "items": {"type": "integer"}, "nullable": True}
 
-    # This object is what we'll pass as the json_schema body.
+    # Strict mode requires: required = every key in properties
+    required_keys = list(props.keys())
+
     return {
         "name": "intake_extract",
         "schema": {
             "type": "object",
             "properties": props,
-            "required": [],
+            "required": required_keys,
             "additionalProperties": False
         },
         "strict": True
