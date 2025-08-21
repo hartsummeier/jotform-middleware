@@ -112,28 +112,45 @@ def extract_with_openai(pdf_bytes, schema):
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
       "model": "gpt-4o-mini",
+      # The "input" format you used is fine
       "input": [{
-        "role":"user",
-        "content":[
-          {"type":"input_text","text":
-           "Read this real estate purchase contract. Extract the fields defined by the schema. "
-           "Return null for anything not present. Keep dates as YYYY-MM-DD if possible. "
-           "For names and addresses, fill sub-fields if available. "
-           "Also include page_refs for where you found key values and an overall confidence (0-1)."},
-          {"type":"input_file","file_id": file_id}
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": (
+              "Read this real estate purchase contract. Extract the fields defined by the schema. "
+              "Return null for anything not present. Keep dates as YYYY-MM-DD if possible. "
+              "For names and addresses, fill sub-fields if available. "
+              "Also include page_refs for where you found key values and an overall confidence (0-1)."
+            )
+          },
+          { "type": "input_file", "file_id": file_id }
         ]
       }],
-      "response_format": {"type":"json_schema","json_schema": schema}
+      # ✅ NEW: Structured output must be specified under the `text` key in the Responses API
+      "modalities": ["text"],
+      "text": {
+        "format": "json_schema",
+        "json_schema": schema
+      },
+      # Extraction: be deterministic
+      "temperature": 0
     }
+
     r = requests.post(url, headers=headers, json=payload, timeout=180)
     try:
         r.raise_for_status()
     except Exception:
-        # Surface the real error in logs or back to Zapier
+        # Bubble up the real server message so you see it in Render logs/Zapier
         raise RuntimeError(f"OpenAI API error: {r.status_code} {r.text[:400]}")
     data = r.json()
+
+    # With structured outputs, most SDKs give you parsed JSON already.
+    # Fallback logic below covers both shapes.
     parsed = data.get("output_parsed")
     if not parsed:
+        # Some responses carry the JSON as text
         content = data.get("output", [{}])[0].get("content", [{}])[0].get("text", "{}")
         parsed = json.loads(content)
     return parsed
@@ -239,3 +256,33 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    try:
+        body = request.get_json(force=True)
+        fub_id      = body.get("fub_id", "")
+        agent_email = body.get("agent_email", "")
+        uploaded_by = body.get("uploaded_by", "")
+        file_url    = body.get("file_url", "")
+
+        pdf_bytes, file_hash = download_file(file_url)
+        schema = make_json_schema(CFG["fields"])
+        extracted = extract_with_openai(pdf_bytes, schema)
+
+        submission_id = jotform_create_submission(
+            INTAKE_FORM_ID, CFG["fields"], extracted, file_hash, fub_id
+        )
+        edit_url = jotform_edit_link(submission_id)
+
+        return jsonify({
+          "ok": True,
+          "submission_id": submission_id,
+          "edit_url": edit_url,
+          "file_hash": file_hash,
+          "agent_email": agent_email,
+          "uploaded_by": uploaded_by
+        })
+    except Exception as e:
+        # Send the message back so Zapier shows it in the task history
+        return jsonify({"ok": False, "error": str(e)}), 400
