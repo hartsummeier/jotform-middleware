@@ -1,41 +1,44 @@
-# app.py (config-driven)
+
 import os, hashlib, json, base64, requests
 from flask import Flask, request, jsonify
 
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
 JOTFORM_API_KEY = os.environ.get("JOTFORM_API_KEY", "")
-# We'll override intake_form_id from fields.json if present
-INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")
+INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")  # can be overridden by fields.json
 
 app = Flask(__name__)
 
 # ---------- load config ----------
-with open("fields.json", "r", encoding="utf-8") as f:
-    CFG = json.load(f)
+def load_cfg():
+    with open("fields.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    return cfg
 
+CFG = load_cfg()
 if CFG.get("intake_form_id"):
     INTAKE_FORM_ID = CFG["intake_form_id"]
 
 # ---------- helpers ----------
 def download_file(url):
+    # For MVP: ensure Jotform "Require login to view uploads" is OFF
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     data = r.content
     return data, hashlib.sha256(data).hexdigest()
 
 def make_json_schema(cfg_fields):
-    """Build OpenAI JSON schema from fields.json"""
+    """Build OpenAI JSON schema based on types in fields.json.
+       Defaults to string if unknown."""
     props = {}
     for f in cfg_fields:
         key = f["key"]
-        ftype = f["type"]
-        # Map config types to JSON schema
+        ftype = f.get("type","string")
         if ftype == "number":
             props[key] = {"type": "number", "nullable": True}
         elif ftype == "date":
             props[key] = {"type": "string", "nullable": True}
         elif ftype == "enum":
-            props[key] = {"type": "string", "enum": f["enum"], "nullable": True}
+            props[key] = {"type": "string", "enum": f.get("enum", []), "nullable": True}
         elif ftype == "full_name":
             props[key] = {
                 "type": "object", "nullable": True,
@@ -70,22 +73,19 @@ def make_json_schema(cfg_fields):
                 },
                 "additionalProperties": False
             }
-        elif ftype in ("json","fixed_string"):  # will be filled by us, not model
-            # Still define them so the final JSON contains them if you want
-            props[key] = {"type":"string","nullable": True}
-        else:  # default to plain string
+        else:
+            # string, fixed_string, json default to string in extraction
             props[key] = {"type": "string", "nullable": True}
 
-    # meta: confidence + page_refs
+    # meta fields for review
     props["confidence"] = {"type":"number","minimum":0,"maximum":1,"nullable": True}
     props["page_refs"]  = {"type":"array","items":{"type":"integer"}, "nullable": True}
 
-    schema = {
+    return {
       "name": "intake_extract",
       "schema": {"type":"object", "properties": props, "required": [], "additionalProperties": False},
       "strict": True
     }
-    return schema
 
 def extract_with_openai(pdf_bytes, schema):
     b64 = base64.b64encode(pdf_bytes).decode("utf-8")
@@ -99,7 +99,7 @@ def extract_with_openai(pdf_bytes, schema):
           {"type":"input_text","text":
            "Read this real estate contract. Extract the fields defined by the schema. "
            "Return null for anything not present. Keep dates as YYYY-MM-DD if possible. "
-           "For names and addresses, fill the sub-fields if available. "
+           "For names and addresses, fill sub-fields if available. "
            "Also include page_refs for where you found key values and an overall confidence (0-1)."},
           {"type":"input_image","image_url": f"data:application/pdf;base64,{b64}"}
         ]
@@ -116,7 +116,7 @@ def extract_with_openai(pdf_bytes, schema):
     return parsed
 
 def jotform_create_submission(form_id, cfg_fields, extracted, file_hash, fub_id):
-    """Build the payload for Jotform, including sub-fields where needed."""
+    """Post values to Jotform. Handles sub-fields for known types."""
     url = f"https://api.jotform.com/form/{form_id}/submissions?apiKey={JOTFORM_API_KEY}"
     payload = {}
 
@@ -126,14 +126,20 @@ def jotform_create_submission(form_id, cfg_fields, extracted, file_hash, fub_id)
         else:
             payload[f"submission[{qid}]"] = value
 
-    # Fill fields from extraction
+    # Optional: look for review_status/confidence_json in config
+    has_review_status = next((f for f in cfg_fields if f.get("key")=="review_status"), None)
+    has_conf_json     = next((f for f in cfg_fields if f.get("key")=="confidence_json"), None)
+
     for f in cfg_fields:
-        key, ftype, qid = f["key"], f["type"], f["qid"]
+        key = f["key"]
+        qid = f["qid"]
+        ftype = f.get("type","string")
         val = extracted.get(key)
 
         if ftype == "fixed_string":
             put(qid, f.get("value",""))
             continue
+
         if ftype == "json":
             meta = {
               "overall": extracted.get("confidence"),
@@ -144,7 +150,7 @@ def jotform_create_submission(form_id, cfg_fields, extracted, file_hash, fub_id)
             put(qid, json.dumps(meta))
             continue
 
-        if val is None:
+        if val is None or val == "":
             continue
 
         if ftype == "full_name" and isinstance(val, dict):
@@ -153,7 +159,6 @@ def jotform_create_submission(form_id, cfg_fields, extracted, file_hash, fub_id)
             if val.get("middle"): put(qid, val["middle"], "middle")
             if val.get("suffix"): put(qid, val["suffix"], "suffix")
         elif ftype == "address" and isinstance(val, dict):
-            # Jotform subkeys can vary; these common ones usually work
             if val.get("line1"):   put(qid, val["line1"],   "addr_line1")
             if val.get("line2"):   put(qid, val["line2"],   "addr_line2")
             if val.get("city"):    put(qid, val["city"],    "city")
@@ -161,14 +166,13 @@ def jotform_create_submission(form_id, cfg_fields, extracted, file_hash, fub_id)
             if val.get("postal"):  put(qid, val["postal"],  "postal")
             if val.get("country"): put(qid, val["country"], "country")
         elif ftype == "phone" and isinstance(val, dict):
-            # Prefer full if you have it; otherwise area/number
             if val.get("full"):
                 put(qid, val["full"], "full")
             else:
                 if val.get("area"):   put(qid, val["area"],   "area")
                 if val.get("number"): put(qid, val["number"], "phone")
         else:
-            # number, enum, string, date, etc.
+            # string, number, enum, date
             put(qid, val)
 
     r = requests.post(url, data=payload, timeout=60)
