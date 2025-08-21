@@ -1,5 +1,5 @@
 # app.py
-import os, json, hashlib, logging, traceback, requests
+import os, json, re, hashlib, logging, traceback, requests
 from flask import Flask, request, jsonify
 
 # -----------------------------------------------------------------------------
@@ -38,6 +38,17 @@ def err(message: str, status: int = 400, **extra):
     if extra:
         out.update(extra)
     return jsonify(out), status
+
+def extract_form_id(value: str) -> str:
+    """
+    Accept either a pure numeric Jotform ID or a full URL and return the numeric ID.
+    """
+    if not value:
+        raise RuntimeError("INTAKE_FORM_ID is missing. Set env var or put intake_form_id in fields.json.")
+    m = re.search(r"(\d{8,})", str(value))
+    if not m:
+        raise RuntimeError(f"Could not parse a numeric Jotform form id from '{value}'.")
+    return m.group(1)
 
 def download_file(url: str):
     """Download PDF. For MVP, ensure Jotform 'Require log-in to view uploaded files' is OFF."""
@@ -111,7 +122,7 @@ def make_json_schema(cfg_fields: list) -> dict:
     props["confidence"] = {"type": "number", "minimum": 0, "maximum": 1, "nullable": True}
     props["page_refs"]  = {"type": "array", "items": {"type": "integer"}, "nullable": True}
 
-    # Strict mode requires: required = every key in properties
+    # Strict mode: required must be every key in properties (nullable allows nulls).
     required_keys = list(props.keys())
 
     return {
@@ -143,23 +154,17 @@ def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
 def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
     """
     Call the Responses API with structured outputs.
-    The schema must be under text.format.schema (not json_schema).
+    The schema must be under text.format.schema.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing.")
 
-    # 1) Upload the PDF to the Files API
     file_id = openai_upload_file(pdf_bytes)
 
-    # 2) Build the format block exactly how the API expects it
     format_block = {
         "type": "json_schema",
-        # name is required per the API error you saw earlier
         "name": schema_obj.get("name", "intake_extract"),
-        # schema must be the pure JSON Schema object
-        # Our make_json_schema() returns {"name","schema","strict"}, so use the inner "schema"
         "schema": schema_obj.get("schema", schema_obj),
-        # strict is allowed here; defaults to True if present in your object
         "strict": schema_obj.get("strict", True),
     }
 
@@ -213,6 +218,9 @@ def jotform_create_submission(form_id: str, cfg_fields: list, extracted: dict,
         raise RuntimeError("JOTFORM_API_KEY is missing.")
     if not form_id:
         raise RuntimeError("INTAKE_FORM_ID is missing. Set env var or put intake_form_id in fields.json.")
+
+    # Normalize: accept pure ID or a full https://form.jotform.com/... URL
+    form_id = extract_form_id(form_id)
 
     url = f"https://api.jotform.com/form/{form_id}/submissions?apiKey={JOTFORM_API_KEY}"
     payload = {}
@@ -268,6 +276,7 @@ def jotform_create_submission(form_id: str, cfg_fields: list, extracted: dict,
             # string, number, enum, date
             put(qid, val)
 
+    logging.info(f"POST Jotform submissions -> {url}")
     r = requests.post(url, data=payload, timeout=90)
     try:
         r.raise_for_status()
@@ -281,7 +290,7 @@ def jotform_edit_link(submission_id: str) -> str:
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return "Middleware is running.", 200
 
