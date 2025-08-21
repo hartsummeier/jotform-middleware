@@ -104,15 +104,14 @@ def make_json_schema(cfg_fields):
     }
 
 def extract_with_openai(pdf_bytes, schema):
-    # 1) Upload file once
+    # 1) Upload the PDF once to the Files API
     file_id = openai_upload_file(pdf_bytes)
 
-    # 2) Ask the model to read that file and return strict JSON
+    # 2) Call the Responses API with structured output under the `text` key.
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
       "model": "gpt-4o-mini",
-      # The "input" format you used is fine
       "input": [{
         "role": "user",
         "content": [
@@ -128,13 +127,11 @@ def extract_with_openai(pdf_bytes, schema):
           { "type": "input_file", "file_id": file_id }
         ]
       }],
-      # ✅ NEW: Structured output must be specified under the `text` key in the Responses API
-      "modalities": ["text"],
+      # NOTE: The Responses API expects structured output format under the `text` object.
       "text": {
         "format": "json_schema",
         "json_schema": schema
       },
-      # Extraction: be deterministic
       "temperature": 0
     }
 
@@ -142,17 +139,19 @@ def extract_with_openai(pdf_bytes, schema):
     try:
         r.raise_for_status()
     except Exception:
-        # Bubble up the real server message so you see it in Render logs/Zapier
+        # Surface the exact server message in your Render logs/Zapier
         raise RuntimeError(f"OpenAI API error: {r.status_code} {r.text[:400]}")
-    data = r.json()
 
-    # With structured outputs, most SDKs give you parsed JSON already.
-    # Fallback logic below covers both shapes.
+    data = r.json()
+    # If the server provides already-parsed JSON, use it. Otherwise read the text.
     parsed = data.get("output_parsed")
     if not parsed:
-        # Some responses carry the JSON as text
-        content = data.get("output", [{}])[0].get("content", [{}])[0].get("text", "{}")
-        parsed = json.loads(content)
+        text_piece = (
+            data.get("output", [{}])[0]
+                .get("content", [{}])[0]
+                .get("text", "{}")
+        )
+        parsed = json.loads(text_piece)
     return parsed
 
 def jotform_create_submission(form_id, cfg_fields, extracted, file_hash, fub_id):
