@@ -1,5 +1,5 @@
 # app.py
-import os, json, base64, hashlib, logging, traceback, requests
+import os, json, hashlib, logging, traceback, requests
 from flask import Flask, request, jsonify
 
 # -----------------------------------------------------------------------------
@@ -7,14 +7,13 @@ from flask import Flask, request, jsonify
 # -----------------------------------------------------------------------------
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
 JOTFORM_API_KEY = os.environ.get("JOTFORM_API_KEY", "")
-INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")  # can be overridden by fields.json
+INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")  # may be overridden by fields.json
 
 # -----------------------------------------------------------------------------
-# App & Logging
+# App & logging
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
 
 # -----------------------------------------------------------------------------
 # Load fields config (fields.json)
@@ -22,8 +21,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 def load_cfg():
     try:
         with open("fields.json", "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        return cfg
+            return json.load(f)
     except FileNotFoundError:
         return None
 
@@ -31,37 +29,35 @@ CFG = load_cfg()
 if CFG and CFG.get("intake_form_id"):
     INTAKE_FORM_ID = CFG["intake_form_id"]
 
-
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 def err(message: str, status: int = 400, **extra):
-    """Return a consistent JSON error to Zapier and log it."""
     logging.error(f"{message} | extra={extra}")
-    payload = {"ok": False, "error": message}
+    out = {"ok": False, "error": message}
     if extra:
-        payload.update(extra)
-    return jsonify(payload), status
+        out.update(extra)
+    return jsonify(out), status
 
 def download_file(url: str):
-    """
-    Download the PDF. For MVP, ensure Jotform Setting 'Require log-in to view uploaded files' is OFF.
-    Returns (bytes, sha256hex).
-    """
+    """Download PDF. For MVP, ensure Jotform 'Require log-in to view uploaded files' is OFF."""
     try:
         r = requests.get(url, timeout=90)
         r.raise_for_status()
         data = r.content
         return data, hashlib.sha256(data).hexdigest()
     except Exception as e:
-        raise RuntimeError(f"Failed to download file from URL. "
-                           f"Hint: turn OFF 'Require log-in to view uploaded files' for testing. Details: {e}")
+        raise RuntimeError(
+            "Failed to download file from URL. "
+            "Hint: turn OFF 'Require log-in to view uploaded files' for testing. "
+            f"Details: {e}"
+        )
 
-def make_json_schema(cfg_fields):
+def make_json_schema(cfg_fields: list) -> dict:
     """
-    Build an OpenAI JSON Schema from fields.json.
+    Build the extraction schema used for Structured Outputs.
     Supported 'type's: string (default), number, date, enum, full_name, address, phone,
-    fixed_string (we fill), json (we fill).
+    fixed_string (we fill ourselves), json (we fill ourselves).
     """
     props = {}
     for f in cfg_fields:
@@ -77,10 +73,10 @@ def make_json_schema(cfg_fields):
             props[key] = {
                 "type": "object", "nullable": True,
                 "properties": {
-                    "first": {"type":"string","nullable": True},
-                    "last":  {"type":"string","nullable": True},
-                    "middle":{"type":"string","nullable": True},
-                    "suffix":{"type":"string","nullable": True}
+                    "first": {"type": "string", "nullable": True},
+                    "last":  {"type": "string", "nullable": True},
+                    "middle":{"type": "string", "nullable": True},
+                    "suffix":{"type": "string", "nullable": True}
                 },
                 "additionalProperties": False
             }
@@ -88,12 +84,12 @@ def make_json_schema(cfg_fields):
             props[key] = {
                 "type": "object", "nullable": True,
                 "properties": {
-                    "line1":   {"type":"string","nullable": True},
-                    "line2":   {"type":"string","nullable": True},
-                    "city":    {"type":"string","nullable": True},
-                    "state":   {"type":"string","nullable": True},
-                    "postal":  {"type":"string","nullable": True},
-                    "country": {"type":"string","nullable": True}
+                    "line1":   {"type": "string", "nullable": True},
+                    "line2":   {"type": "string", "nullable": True},
+                    "city":    {"type": "string", "nullable": True},
+                    "state":   {"type": "string", "nullable": True},
+                    "postal":  {"type": "string", "nullable": True},
+                    "country": {"type": "string", "nullable": True}
                 },
                 "additionalProperties": False
             }
@@ -101,24 +97,25 @@ def make_json_schema(cfg_fields):
             props[key] = {
                 "type": "object", "nullable": True,
                 "properties": {
-                    "area":  {"type":"string","nullable": True},
-                    "number":{"type":"string","nullable": True},
-                    "full":  {"type":"string","nullable": True}
+                    "area":  {"type": "string", "nullable": True},
+                    "number":{"type": "string", "nullable": True},
+                    "full":  {"type": "string", "nullable": True}
                 },
                 "additionalProperties": False
             }
         else:
-            # string / fixed_string / json default to string in extraction
+            # string / fixed_string / json -> extract as string (we may overwrite later)
             props[key] = {"type": "string", "nullable": True}
 
-    # meta fields from the model
+    # meta from model
     props["confidence"] = {"type": "number", "minimum": 0, "maximum": 1, "nullable": True}
-    props["page_refs"]  = {"type": "array", "items": {"type":"integer"}, "nullable": True}
+    props["page_refs"]  = {"type": "array", "items": {"type": "integer"}, "nullable": True}
 
+    # This object is what we'll pass as the json_schema body.
     return {
         "name": "intake_extract",
         "schema": {
-            "type":"object",
+            "type": "object",
             "properties": props,
             "required": [],
             "additionalProperties": False
@@ -127,7 +124,7 @@ def make_json_schema(cfg_fields):
     }
 
 def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
-    """Upload the PDF to OpenAI Files API and return file_id."""
+    """Upload PDF to OpenAI Files API; return file_id."""
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing.")
     url = "https://api.openai.com/v1/files"
@@ -141,10 +138,10 @@ def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
         raise RuntimeError(f"OpenAI file upload error: {r.status_code} {r.text[:400]}")
     return r.json()["id"]
 
-def extract_with_openai(pdf_bytes: bytes, schema: dict) -> dict:
+def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
     """
-    Call the Responses API with structured outputs (schema under text.format).
-    Returns a dict of extracted values keyed by the 'key' strings from fields.json.
+    Call Responses API with structured outputs.
+    NOTE: API now requires `text.format.name` in addition to `type` and `json_schema`.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing.")
@@ -170,11 +167,12 @@ def extract_with_openai(pdf_bytes: bytes, schema: dict) -> dict:
                 {"type": "input_file", "file_id": file_id}
             ]
         }],
-        # IMPORTANT: schema goes under text.format for the Responses API
+        # ✅ Correct placement AND required name
         "text": {
             "format": {
                 "type": "json_schema",
-                "json_schema": schema
+                "name": schema_obj.get("name", "intake_extract"),
+                "json_schema": schema_obj
             }
         },
         "temperature": 0
@@ -187,7 +185,6 @@ def extract_with_openai(pdf_bytes: bytes, schema: dict) -> dict:
         raise RuntimeError(f"OpenAI API error: {r.status_code} {r.text[:400]}")
 
     data = r.json()
-    # Prefer parsed when provided; otherwise fall back to text
     parsed = data.get("output_parsed")
     if not parsed:
         try:
@@ -203,9 +200,7 @@ def extract_with_openai(pdf_bytes: bytes, schema: dict) -> dict:
 
 def jotform_create_submission(form_id: str, cfg_fields: list, extracted: dict,
                               file_hash: str, fub_id: str) -> str:
-    """
-    Post values to Jotform. Handles subfields for full_name, address, phone.
-    """
+    """Create a Jotform submission; handles subfields for full_name, address, phone."""
     if not JOTFORM_API_KEY:
         raise RuntimeError("JOTFORM_API_KEY is missing.")
     if not form_id:
@@ -275,7 +270,6 @@ def jotform_create_submission(form_id: str, cfg_fields: list, extracted: dict,
 def jotform_edit_link(submission_id: str) -> str:
     return f"https://www.jotform.com/edit/{submission_id}"
 
-
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
@@ -285,7 +279,6 @@ def health():
 
 @app.route("/ingest", methods=["POST"])
 def ingest():
-    # Single, robust handler (no duplicate route names)
     try:
         if CFG is None:
             return err("fields.json not found in the working directory.", 500)
@@ -299,7 +292,6 @@ def ingest():
         agent_email = body.get("agent_email", "")
         uploaded_by = body.get("uploaded_by", "")
         file_url    = body.get("file_url", "")
-
         if not file_url:
             return err("file_url is required in the payload.")
 
@@ -307,8 +299,8 @@ def ingest():
         pdf_bytes, file_hash = download_file(file_url)
 
         # 2) Build schema & extract
-        schema    = make_json_schema(CFG["fields"])
-        extracted = extract_with_openai(pdf_bytes, schema)
+        schema_obj = make_json_schema(CFG["fields"])
+        extracted  = extract_with_openai(pdf_bytes, schema_obj)
 
         # 3) Create Jotform submission
         submission_id = jotform_create_submission(
@@ -328,7 +320,6 @@ def ingest():
     except Exception as e:
         logging.error("ingest error: %s\n%s", e, traceback.format_exc())
         return err(str(e), 400)
-
 
 # -----------------------------------------------------------------------------
 # Entrypoint
