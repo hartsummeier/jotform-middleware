@@ -1,5 +1,6 @@
 # app.py
 import os, json, re, hashlib, logging, traceback, requests
+from datetime import datetime
 from flask import Flask, request, jsonify
 
 # -----------------------------------------------------------------------------
@@ -7,79 +8,155 @@ from flask import Flask, request, jsonify
 # -----------------------------------------------------------------------------
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
 JOTFORM_API_KEY = os.environ.get("JOTFORM_API_KEY", "")
-INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")  # may be overridden by fields.json
+# Optional fallback if you don't set intake_form_id in fields.json
+INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")
 
 # -----------------------------------------------------------------------------
 # App & logging
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 # -----------------------------------------------------------------------------
-# Load fields config (fields.json)
+# Config
 # -----------------------------------------------------------------------------
 def load_cfg():
-    try:
-        with open("fields.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return None
+    with open("fields.json", "r", encoding="utf-8") as f:
+        return json.load(f)
 
 CFG = load_cfg()
-if CFG and CFG.get("intake_form_id"):
+if CFG.get("intake_form_id"):
     INTAKE_FORM_ID = CFG["intake_form_id"]
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Jotform helpers
 # -----------------------------------------------------------------------------
-def err(message: str, status: int = 400, **extra):
-    logging.error(f"{message} | extra={extra}")
-    out = {"ok": False, "error": message}
-    if extra:
-        out.update(extra)
-    return jsonify(out), status
-
 def extract_form_id(value: str) -> str:
-    """
-    Accept either a pure numeric Jotform ID or a full URL and return the numeric ID.
-    """
+    """Accept either a numeric ID or a full URL; return numeric ID."""
     if not value:
-        raise RuntimeError("INTAKE_FORM_ID is missing. Set env var or put intake_form_id in fields.json.")
+        raise RuntimeError("INTAKE_FORM_ID is missing.")
     m = re.search(r"(\d{8,})", str(value))
     if not m:
-        raise RuntimeError(f"Could not parse a numeric Jotform form id from '{value}'.")
+        raise RuntimeError(f"Could not parse a numeric form id from '{value}'.")
     return m.group(1)
 
-def download_file(url: str):
-    """Download PDF. For MVP, ensure Jotform 'Require log-in to view uploaded files' is OFF."""
+def jf_get_questions(form_id: str) -> dict:
+    """Return dict of {qid: question_obj} from Jotform."""
+    if not JOTFORM_API_KEY:
+        raise RuntimeError("JOTFORM_API_KEY env var not set.")
+    form_id = extract_form_id(form_id)
+    url = f"https://api.jotform.com/form/{form_id}/questions?apiKey={JOTFORM_API_KEY}"
+    r = requests.get(url, timeout=90)
     try:
-        r = requests.get(url, timeout=90)
+        r.raise_for_status()
+    except Exception:
+        raise RuntimeError(f"Jotform /questions error: {r.status_code} {r.text[:400]}")
+    return r.json()["content"]
+
+def jf_type_to_model_type(jf_type: str, override: dict | None) -> str:
+    """Map Jotform control types to our internal types for schema/submission."""
+    if override and "type" in override:
+        return override["type"]
+    t = jf_type or ""
+    # Common mappings
+    if t in ("control_fullname",):               return "full_name"
+    if t in ("control_address",):                return "address"
+    if t in ("control_phone",):                  return "phone"
+    if t in ("control_datetime",):               return "date"
+    if t in ("control_number", "control_spinner"): return "number"
+    if t in ("control_dropdown", "control_radio"): return "enum"
+    # Everything else we treat as string (textbox, textarea, email, calc text, etc.)
+    return "string"
+
+def build_live_catalog():
+    """Build a list of field descriptors from the live Jotform, honoring config."""
+    qs = jf_get_questions(INTAKE_FORM_ID)  # dict keyed by qid
+    exclude_types = set(CFG.get("exclude_types", []))
+    overrides = CFG.get("overrides", {})
+
+    fields = []
+    for qid, q in qs.items():
+        jf_type = q.get("type") or ""
+        if jf_type in exclude_types:
+            continue
+        unique = q.get("name") or ""  # Jotform Unique Name (no spaces)
+        label  = q.get("text") or unique
+        if not unique:
+            continue
+
+        ov = overrides.get(unique, {})
+        ftype = jf_type_to_model_type(jf_type, ov)
+
+        # Build enum options for dropdown/radio if present
+        enum = None
+        if ftype == "enum":
+            # Jotform stores options either as "options": "A|B|C" or list
+            props = q.get("properties") or {}
+            opts  = props.get("options")
+            if isinstance(opts, str):
+                enum = [o.strip() for o in opts.split("|") if o.strip()]
+            elif isinstance(opts, list):
+                enum = [str(o).strip() for o in opts if str(o).strip()]
+
+        fields.append({
+            "key": unique,        # used in extraction JSON
+            "qid": str(qid),      # used when submitting back to Jotform
+            "label": label,
+            "type": ov.get("type", ftype),
+            "enum": ov.get("enum", enum)
+        })
+    logging.info("Live catalog size: %d", len(fields))
+    return fields
+
+# -----------------------------------------------------------------------------
+# OpenAI helpers
+# -----------------------------------------------------------------------------
+def download_file(url: str):
+    """Download file; for Jotform uploads, ensure 'Require log-in to view uploaded files' is OFF."""
+    try:
+        r = requests.get(url, timeout=120)
         r.raise_for_status()
         data = r.content
         return data, hashlib.sha256(data).hexdigest()
     except Exception as e:
         raise RuntimeError(
             "Failed to download file from URL. "
-            "Hint: turn OFF 'Require log-in to view uploaded files' for testing. "
+            "If it's a Jotform file, make sure 'Require log-in to view uploaded files' is OFF. "
             f"Details: {e}"
         )
 
-def make_json_schema(cfg_fields: list) -> dict:
-    """
-    Build the extraction schema used for Structured Outputs.
-    Supported 'type's: string (default), number, date, enum, full_name, address, phone,
-    fixed_string (we fill ourselves), json (we fill ourselves).
-    """
+def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing.")
+    url = "https://api.openai.com/v1/files"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    files = {"file": (filename, pdf_bytes, "application/pdf")}
+    data  = {"purpose": "assistants"}
+    r = requests.post(url, headers=headers, files=files, data=data, timeout=180)
+    try:
+        r.raise_for_status()
+    except Exception:
+        raise RuntimeError(f"OpenAI file upload error: {r.status_code} {r.text[:400]}")
+    return r.json()["id"]
+
+def make_json_schema_from_fields(fields: list[dict]) -> dict:
     props = {}
-    for f in cfg_fields:
+    for f in fields:
         key = f["key"]
         ftype = f.get("type", "string")
         if ftype == "number":
             props[key] = {"type": "number", "nullable": True}
         elif ftype == "date":
-            props[key] = {"type": "string", "nullable": True}
+            props[key] = {"type": "string", "nullable": True}  # YYYY-MM-DD preferred
         elif ftype == "enum":
-            props[key] = {"type": "string", "enum": f.get("enum", []), "nullable": True}
+            enum = f.get("enum")
+            if enum:
+                props[key] = {"type": "string", "enum": enum, "nullable": True}
+            else:
+                props[key] = {"type": "string", "nullable": True}
         elif ftype == "full_name":
             props[key] = {
                 "type": "object", "nullable": True,
@@ -108,66 +185,33 @@ def make_json_schema(cfg_fields: list) -> dict:
             props[key] = {
                 "type": "object", "nullable": True,
                 "properties": {
-                    "area":  {"type": "string", "nullable": True},
-                    "number":{"type": "string", "nullable": True},
-                    "full":  {"type": "string", "nullable": True}
+                    "full":   {"type": "string", "nullable": True},
+                    "area":   {"type": "string", "nullable": True},
+                    "number": {"type": "string", "nullable": True}
                 },
                 "additionalProperties": False
             }
         else:
-            # string / fixed_string / json -> extract as string (we may overwrite later)
             props[key] = {"type": "string", "nullable": True}
 
-    # meta from model
+    # Global meta
     props["confidence"] = {"type": "number", "minimum": 0, "maximum": 1, "nullable": True}
     props["page_refs"]  = {"type": "array", "items": {"type": "integer"}, "nullable": True}
 
-    # Strict mode: required must be every key in properties (nullable allows nulls).
-    required_keys = list(props.keys())
-
+    required = list(props.keys())
     return {
         "name": "intake_extract",
         "schema": {
             "type": "object",
             "properties": props,
-            "required": required_keys,
+            "required": required if CFG.get("strict_schema", True) else [],
             "additionalProperties": False
         },
-        "strict": True
+        "strict": CFG.get("strict_schema", True)
     }
-
-def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
-    """Upload PDF to OpenAI Files API; return file_id."""
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing.")
-    url = "https://api.openai.com/v1/files"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    files = {"file": (filename, pdf_bytes, "application/pdf")}
-    data  = {"purpose": "assistants"}
-    r = requests.post(url, headers=headers, files=files, data=data, timeout=180)
-    try:
-        r.raise_for_status()
-    except Exception:
-        raise RuntimeError(f"OpenAI file upload error: {r.status_code} {r.text[:400]}")
-    return r.json()["id"]
 
 def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
-    """
-    Call the Responses API with structured outputs.
-    The schema must be under text.format.schema.
-    """
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing.")
-
     file_id = openai_upload_file(pdf_bytes)
-
-    format_block = {
-        "type": "json_schema",
-        "name": schema_obj.get("name", "intake_extract"),
-        "schema": schema_obj.get("schema", schema_obj),
-        "strict": schema_obj.get("strict", True),
-    }
-
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     payload = {
@@ -178,25 +222,27 @@ def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
                 {
                     "type": "input_text",
                     "text": (
-                        "Read this real estate purchase contract. Extract the fields defined by the schema. "
-                        "Return null for anything not present. Keep dates as YYYY-MM-DD if possible. "
-                        "For names and addresses, fill sub-fields if available. "
-                        "Also include page_refs for where you found key values and an overall confidence (0-1)."
+                        "Read this real estate purchase contract (may include addenda). "
+                        "Extract the fields in the schema. "
+                        "Use null when information is not present. "
+                        "Format dates as YYYY-MM-DD when possible. "
+                        "For names/addresses/phones, fill sub-fields if available. "
+                        "Also include 'page_refs' listing page numbers where key values were found "
+                        "and an overall 'confidence' between 0 and 1."
                     )
                 },
                 {"type": "input_file", "file_id": file_id}
             ]
         }],
-        "text": { "format": format_block },
+        # Structured output (Responses API)
+        "text": { "format": schema_obj },
         "temperature": 0
     }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=180)
+    r = requests.post(url, headers=headers, json=payload, timeout=240)
     try:
         r.raise_for_status()
     except Exception:
-        raise RuntimeError(f"OpenAI API error: {r.status_code} {r.text[:400]}")
-
+        raise RuntimeError(f"OpenAI API error: {r.status_code} {r.text[:500]}")
     data = r.json()
     parsed = data.get("output_parsed")
     if not parsed:
@@ -211,77 +257,113 @@ def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
             parsed = {}
     return parsed
 
-def jotform_create_submission(form_id: str, cfg_fields: list, extracted: dict,
-                              file_hash: str, fub_id: str) -> str:
-    """Create a Jotform submission; handles subfields for full_name, address, phone."""
-    if not JOTFORM_API_KEY:
-        raise RuntimeError("JOTFORM_API_KEY is missing.")
-    if not form_id:
-        raise RuntimeError("INTAKE_FORM_ID is missing. Set env var or put intake_form_id in fields.json.")
+# -----------------------------------------------------------------------------
+# Submission helpers
+# -----------------------------------------------------------------------------
+def put_field(payload: dict, qid: str, value, subkey: str | None = None):
+    if subkey:
+        payload[f"submission[{qid}][{subkey}]"] = value
+    else:
+        payload[f"submission[{qid}]"] = value
 
-    # Normalize: accept pure ID or a full https://form.jotform.com/... URL
+def parse_date_yyyy_mm_dd(s: str) -> tuple[int,int,int] | None:
+    # Accept 'YYYY-MM-DD' or many common variants
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+    # Try strict
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.month, dt.day, dt.year
+        except Exception:
+            pass
+    # loose fallback: digits only
+    m = re.findall(r"\d+", s)
+    if len(m) == 3:
+        a, b, c = [int(x) for x in m]
+        # Heuristic: if 4-digit present first -> Y-M-D
+        if len(m[0]) == 4:
+            return b, c, a
+        # If last has 4 digits -> M-D-Y
+        if len(m[-1]) == 4:
+            return a, b, c
+    return None
+
+def jotform_create_submission(form_id: str, fields: list[dict], extracted: dict,
+                              file_hash: str, fub_id: str | None = None) -> str:
     form_id = extract_form_id(form_id)
-
     url = f"https://api.jotform.com/form/{form_id}/submissions?apiKey={JOTFORM_API_KEY}"
     payload = {}
 
-    def put(qid, value, subkey=None):
-        if subkey:
-            payload[f"submission[{qid}][{subkey}]"] = value
-        else:
-            payload[f"submission[{qid}]"] = value
+    # Optional meta field with extraction info (skip if you don't have a target field)
+    meta = {
+        "overall": extracted.get("confidence"),
+        "page_refs": extracted.get("page_refs"),
+        "source_file_hash": file_hash,
+        "fub_id": fub_id
+    }
+    # If you have a long text field to hold meta, you can set it here:
+    # put_field(payload, "<QID_OF_META_FIELD>", json.dumps(meta))
 
-    for f in cfg_fields:
-        key   = f["key"]
-        qid   = f["qid"]
-        ftype = f.get("type", "string")
-        val   = extracted.get(key)
-
-        if ftype == "fixed_string":
-            put(qid, f.get("value", ""))
-            continue
-
-        if ftype == "json":
-            meta = {
-                "overall":   extracted.get("confidence"),
-                "page_refs": extracted.get("page_refs"),
-                "source_file_hash": file_hash,
-                "fub_id": fub_id
-            }
-            put(qid, json.dumps(meta))
-            continue
+    for f in fields:
+        key  = f["key"]
+        qid  = f["qid"]
+        ftyp = f.get("type", "string")
+        val  = extracted.get(key, None)
 
         if val in (None, ""):
             continue
 
-        if ftype == "full_name" and isinstance(val, dict):
-            if val.get("first"):  put(qid, val["first"],  "first")
-            if val.get("last"):   put(qid, val["last"],   "last")
-            if val.get("middle"): put(qid, val["middle"], "middle")
-            if val.get("suffix"): put(qid, val["suffix"], "suffix")
-        elif ftype == "address" and isinstance(val, dict):
-            if val.get("line1"):   put(qid, val["line1"],   "addr_line1")
-            if val.get("line2"):   put(qid, val["line2"],   "addr_line2")
-            if val.get("city"):    put(qid, val["city"],    "city")
-            if val.get("state"):   put(qid, val["state"],   "state")
-            if val.get("postal"):  put(qid, val["postal"],  "postal")
-            if val.get("country"): put(qid, val["country"], "country")
-        elif ftype == "phone" and isinstance(val, dict):
+        if ftyp == "full_name" and isinstance(val, dict):
+            if val.get("first"):  put_field(payload, qid, val["first"],  "first")
+            if val.get("last"):   put_field(payload, qid, val["last"],   "last")
+            if val.get("middle"): put_field(payload, qid, val["middle"], "middle")
+            if val.get("suffix"): put_field(payload, qid, val["suffix"], "suffix")
+        elif ftyp == "address" and isinstance(val, dict):
+            if val.get("line1"):   put_field(payload, qid, val["line1"],   "addr_line1")
+            if val.get("line2"):   put_field(payload, qid, val["line2"],   "addr_line2")
+            if val.get("city"):    put_field(payload, qid, val["city"],    "city")
+            if val.get("state"):   put_field(payload, qid, val["state"],   "state")
+            if val.get("postal"):  put_field(payload, qid, val["postal"],  "postal")
+            if val.get("country"): put_field(payload, qid, val["country"], "country")
+        elif ftyp == "phone" and isinstance(val, dict):
             if val.get("full"):
-                put(qid, val["full"], "full")
+                put_field(payload, qid, val["full"], "full")
             else:
-                if val.get("area"):   put(qid, val["area"],   "area")
-                if val.get("number"): put(qid, val["number"], "phone")
+                if val.get("area"):   put_field(payload, qid, val["area"],   "area")
+                if val.get("number"): put_field(payload, qid, val["number"], "phone")
+        elif ftyp == "date":
+            if isinstance(val, dict):
+                # If the model returned components
+                m = val.get("month"); d = val.get("day"); y = val.get("year")
+                if m and d and y:
+                    put_field(payload, qid, m, "month")
+                    put_field(payload, qid, d, "day")
+                    put_field(payload, qid, y, "year")
+                elif val.get("raw"):
+                    comp = parse_date_yyyy_mm_dd(val["raw"])
+                    if comp:
+                        m, d, y = comp
+                        put_field(payload, qid, m, "month")
+                        put_field(payload, qid, d, "day")
+                        put_field(payload, qid, y, "year")
+            elif isinstance(val, str):
+                comp = parse_date_yyyy_mm_dd(val)
+                if comp:
+                    m, d, y = comp
+                    put_field(payload, qid, m, "month")
+                    put_field(payload, qid, d, "day")
+                    put_field(payload, qid, y, "year")
         else:
-            # string, number, enum, date
-            put(qid, val)
+            # string, number, enum -> single value
+            put_field(payload, qid, val)
 
-    logging.info(f"POST Jotform submissions -> {url}")
-    r = requests.post(url, data=payload, timeout=90)
+    r = requests.post(url, data=payload, timeout=120)
     try:
         r.raise_for_status()
     except Exception:
-        raise RuntimeError(f"Jotform API error: {r.status_code} {r.text[:300]}")
+        raise RuntimeError(f"Jotform API error: {r.status_code} {r.text[:400]}")
     return r.json()["content"]["submissionID"]
 
 def jotform_edit_link(submission_id: str) -> str:
@@ -297,12 +379,10 @@ def health():
 @app.route("/ingest", methods=["POST"])
 def ingest():
     try:
-        if CFG is None:
-            return err("fields.json not found in the working directory.", 500)
         if not OPENAI_API_KEY:
-            return err("OPENAI_API_KEY env var not set.", 500)
-        if not (JOTFORM_API_KEY and (INTAKE_FORM_ID or CFG.get("intake_form_id"))):
-            return err("JOTFORM_API_KEY or INTAKE_FORM_ID missing.", 500)
+            return jsonify({"ok": False, "error": "OPENAI_API_KEY not set"}), 500
+        if not (JOTFORM_API_KEY and INTAKE_FORM_ID):
+            return jsonify({"ok": False, "error": "JOTFORM_API_KEY or INTAKE_FORM_ID missing"}), 500
 
         body = request.get_json(force=True) or {}
         fub_id      = body.get("fub_id", "")
@@ -310,18 +390,21 @@ def ingest():
         uploaded_by = body.get("uploaded_by", "")
         file_url    = body.get("file_url", "")
         if not file_url:
-            return err("file_url is required in the payload.")
+            return jsonify({"ok": False, "error": "file_url is required"}), 400
 
         # 1) Download PDF
         pdf_bytes, file_hash = download_file(file_url)
 
-        # 2) Build schema & extract
-        schema_obj = make_json_schema(CFG["fields"])
-        extracted  = extract_with_openai(pdf_bytes, schema_obj)
+        # 2) Build *live* catalog & schema from Jotform questions
+        fields = build_live_catalog()
+        schema_obj = make_json_schema_from_fields(fields)
 
-        # 3) Create Jotform submission
+        # 3) Extract with OpenAI
+        extracted = extract_with_openai(pdf_bytes, schema_obj)
+
+        # 4) Create Jotform submission
         submission_id = jotform_create_submission(
-            INTAKE_FORM_ID, CFG["fields"], extracted, file_hash, fub_id
+            INTAKE_FORM_ID, fields, extracted, file_hash, fub_id
         )
         edit_url = jotform_edit_link(submission_id)
 
@@ -333,10 +416,9 @@ def ingest():
             "agent_email": agent_email,
             "uploaded_by": uploaded_by
         })
-
     except Exception as e:
         logging.error("ingest error: %s\n%s", e, traceback.format_exc())
-        return err(str(e), 400)
+        return jsonify({"ok": False, "error": str(e)}), 400
 
 # -----------------------------------------------------------------------------
 # Entrypoint
