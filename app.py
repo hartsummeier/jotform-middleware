@@ -188,6 +188,9 @@ def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
     file_id = openai_upload_file(pdf_bytes)
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+    format_block = {"type": "json_schema", **schema_obj}  # << add type here
+
     payload = {
         "model": "gpt-4o-mini",
         "input": [{
@@ -202,8 +205,7 @@ def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
                 {"type":"input_file","file_id": file_id}
             ]
         }],
-        # Structured output is provided under 'text' -> 'format'
-        "text": { "format": { **schema_obj } },
+        "text": { "format": format_block },  # <-- now includes 'type'
         "temperature": 0
     }
     r = requests.post(url, headers=headers, json=payload, timeout=240)
