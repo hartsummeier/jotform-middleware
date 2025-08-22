@@ -144,50 +144,68 @@ def make_json_schema_from_fields(fields: list[dict]) -> dict:
             props[key] = {"type": "string", "nullable": True}
         elif ftype == "enum":
             enum = f.get("enum")
-            props[key] = {"type": "string", "enum": enum, "nullable": True} if enum else {"type": "string", "nullable": True}
+            if enum:
+                props[key] = {"type": "string", "enum": enum, "nullable": True}
+            else:
+                props[key] = {"type": "string", "nullable": True}
         elif ftype == "full_name":
+            subprops = {
+                "first":  {"type":"string","nullable": True},
+                "last":   {"type":"string","nullable": True},
+                "middle": {"type":"string","nullable": True},
+                "suffix": {"type":"string","nullable": True}
+            }
             props[key] = {
-                "type": "object", "nullable": True,
-                "properties": {
-                    "first": {"type":"string","nullable": True},
-                    "last":  {"type":"string","nullable": True},
-                    "middle":{"type":"string","nullable": True},
-                    "suffix":{"type":"string","nullable": True}
-                },
+                "type": "object",
+                "nullable": True,
+                "properties": subprops,
+                "required": list(subprops.keys()),           # <-- add this
                 "additionalProperties": False
             }
         elif ftype == "address":
+            subprops = {
+                "line1":   {"type":"string","nullable": True},
+                "line2":   {"type":"string","nullable": True},
+                "city":    {"type":"string","nullable": True},
+                "state":   {"type":"string","nullable": True},
+                "postal":  {"type":"string","nullable": True},
+                "country": {"type":"string","nullable": True}
+            }
             props[key] = {
-                "type": "object", "nullable": True,
-                "properties": {
-                    "line1":   {"type":"string","nullable": True},
-                    "line2":   {"type":"string","nullable": True},
-                    "city":    {"type":"string","nullable": True},
-                    "state":   {"type":"string","nullable": True},
-                    "postal":  {"type":"string","nullable": True},
-                    "country": {"type":"string","nullable": True}
-                },
+                "type": "object",
+                "nullable": True,
+                "properties": subprops,
+                "required": list(subprops.keys()),           # <-- add this
                 "additionalProperties": False
             }
         elif ftype == "phone":
+            subprops = {
+                "full":   {"type":"string","nullable": True},
+                "area":   {"type":"string","nullable": True},
+                "number": {"type":"string","nullable": True}
+            }
             props[key] = {
-                "type": "object", "nullable": True,
-                "properties": {
-                    "full":   {"type":"string","nullable": True},
-                    "area":   {"type":"string","nullable": True},
-                    "number": {"type":"string","nullable": True}
-                },
+                "type": "object",
+                "nullable": True,
+                "properties": subprops,
+                "required": list(subprops.keys()),           # <-- add this
                 "additionalProperties": False
             }
         else:
             props[key] = {"type": "string", "nullable": True}
 
+    # meta from model
     props["confidence"] = {"type":"number","minimum":0,"maximum":1,"nullable": True}
     props["page_refs"]  = {"type":"array","items":{"type":"integer"}, "nullable": True}
 
     return {
         "name": "intake_extract",
-        "schema": {"type":"object","properties": props,"required": list(props.keys()),"additionalProperties": False},
+        "schema": {
+            "type":"object",
+            "properties": props,
+            "required": list(props.keys()),
+            "additionalProperties": False
+        },
         "strict": True
     }
 
