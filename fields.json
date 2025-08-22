@@ -1,8 +1,6 @@
 {
   "intake_form_id": "252318171421044",
   "include_all_questions": true,
-
-  // Optional: skip non-input controls if you want to be explicit.
   "exclude_types": [
     "control_head",
     "control_pagebreak",
@@ -14,14 +12,6 @@
     "control_signature",
     "control_matrix"
   ],
-
-  // Optional: if you later need to force a specific type for a field
-  // or rename a key, put it here by Unique Name.
-  "overrides": {
-    // "PurchasePrice": { "type": "number" },
-    // "ClosingDate":   { "type": "date" }
-  },
-
-  // Leave true unless you run into unexpected model refusals.
+  "overrides": {},
   "strict_schema": true
 }
