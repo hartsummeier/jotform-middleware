@@ -101,9 +101,16 @@ def build_live_catalog():
     return fields
 
 # ---------- openai helpers ----------
+def _sanitize_jotform_file_url(u: str) -> str:
+    u = u.strip().strip("<>").strip("\"'")
+    u = re.sub(r'%3E(?=\?|$)', '', u, flags=re.IGNORECASE)
+    u = re.sub(r'>(?=\?|$)', '', u)
+    return u
+
 def download_file(url: str):
     try:
-        r = requests.get(url, timeout=120)
+        clean = _sanitize_jotform_file_url(url)
+        r = requests.get(clean, timeout=120)
         r.raise_for_status()
         data = r.content
         return data, hashlib.sha256(data).hexdigest()
