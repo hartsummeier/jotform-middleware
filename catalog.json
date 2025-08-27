@@ -1,0 +1,27 @@
+python3 - << 'PY'
+import json, sys
+form_id = "252318171421044"   # <-- keep this the CONTRACT INTAKE form id
+data = json.load(open("catalog.json"))
+fields = []
+for f in data["fields"]:
+    entry = {
+        "key":  f.get("key"),
+        "qid":  str(f.get("qid")),
+        "type": f.get("type") or "string"
+    }
+    if f.get("enum"): entry["enum"] = f["enum"]
+    fields.append(entry)
+
+cfg = {
+  "intake_form_id": form_id,
+  "fields": fields,
+  // optional knobs:
+  "exclude_types": [],
+  "overrides": {}
+}
+# strip // comment line for strict JSON:
+txt = json.dumps(cfg, indent=2).replace("// optional knobs:\n", "")
+print(txt)
+open("fields.json","w").write(txt)
+print("Wrote fields.json with", len(fields), "fields.")
+PY
