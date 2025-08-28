@@ -1,2 +1,4 @@
 flask==3.0.2
 requests==2.32.3
+pdfminer.six==20231228
+rapidfuzz==3.9.6
