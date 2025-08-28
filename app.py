@@ -145,91 +145,153 @@ def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
     return r.json()["id"]
 
 def make_json_schema_from_subset(subset_fields):
-    """Structured Outputs schema for only the still-missing fields."""
+    """
+    Build a compact JSON Schema for the still-missing fields.
+    Keep it simple to avoid API rejections.
+    """
     props = {}
     for f in subset_fields:
-        k, t = f["key"], f.get("type","string")
+        k, t = f["key"], f.get("type", "string")
+
+        # Basic shapes only (avoid nullable for now)
         if t == "number":
-            props[k] = {"type": "number", "nullable": True}
+            props[k] = {"type": "number"}
         elif t == "date":
-            props[k] = {"type": "string", "nullable": True}
+            props[k] = {"type": "string"}
         elif t == "enum":
             enum = f.get("enum")
-            props[k] = {"type":"string","enum": enum, "nullable": True} if enum else {"type":"string","nullable": True}
+            if enum:
+                props[k] = {"type": "string", "enum": enum}
+            else:
+                props[k] = {"type": "string"}
         elif t == "multi_enum":
             enum = f.get("enum") or []
-            props[k] = {"type":"array","items":{"type":"string","enum": enum}, "nullable": True}
+            if enum:
+                props[k] = {"type": "array", "items": {"type": "string", "enum": enum}}
+            else:
+                props[k] = {"type": "array", "items": {"type": "string"}}
         elif t == "full_name":
-            props[k] = {"type":"object","nullable":True,"properties":{
-                "first":{"type":"string","nullable":True},
-                "last":{"type":"string","nullable":True},
-                "middle":{"type":"string","nullable":True},
-                "suffix":{"type":"string","nullable":True}
-            }, "additionalProperties": False}
+            props[k] = {
+                "type": "object",
+                "properties": {
+                    "first":  {"type":"string"},
+                    "last":   {"type":"string"},
+                    "middle": {"type":"string"},
+                    "suffix": {"type":"string"}
+                },
+                "additionalProperties": False
+            }
         elif t == "address":
-            props[k] = {"type":"object","nullable":True,"properties":{
-                "line1":{"type":"string","nullable":True},
-                "line2":{"type":"string","nullable":True},
-                "city":{"type":"string","nullable":True},
-                "state":{"type":"string","nullable":True},
-                "postal":{"type":"string","nullable":True},
-                "country":{"type":"string","nullable":True}
-            }, "additionalProperties": False}
+            props[k] = {
+                "type": "object",
+                "properties": {
+                    "line1":   {"type":"string"},
+                    "line2":   {"type":"string"},
+                    "city":    {"type":"string"},
+                    "state":   {"type":"string"},
+                    "postal":  {"type":"string"},
+                    "country": {"type":"string"}
+                },
+                "additionalProperties": False
+            }
         elif t == "phone":
-            props[k] = {"type":"object","nullable":True,"properties":{
-                "full":{"type":"string","nullable":True},
-                "area":{"type":"string","nullable":True},
-                "number":{"type":"string","nullable":True}
-            }, "additionalProperties": False}
+            props[k] = {
+                "type": "object",
+                "properties": {
+                    "full":   {"type":"string"},
+                    "area":   {"type":"string"},
+                    "number": {"type":"string"}
+                },
+                "additionalProperties": False
+            }
         else:
-            props[k] = {"type": "string", "nullable": True}
+            props[k] = {"type": "string"}
+
+    # Keep it permissive; we’ll post-process
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": props,
+        "required": [],                    # not forcing presence
+        "additionalProperties": False
+    }
+
     return {
         "name": "intake_extract_subset",
-        "schema": {"type":"object","properties": props, "required": list(props.keys()), "additionalProperties": False},
+        "schema": schema,
         "strict": True
     }
 
+
 def llm_extract_missing(pdf_bytes: bytes, missing_fields):
-    """Ask the model only for what is still missing."""
+    """
+    Ask the model ONLY for missing fields, in small batches (to keep schema small).
+    Uses the Responses API with text.format.json_schema.
+    """
     if not missing_fields:
         return {}
+
+    # Upload the PDF once
     file_id = openai_upload_file(pdf_bytes)
-    schema_obj = make_json_schema_from_subset(missing_fields)
-    url = "https://api.openai.com/v1/responses"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    payload = {
-        "model": "gpt-4o-mini",
-        "input": [{
-            "role":"user",
-            "content":[
-                {"type":"input_text","text":
-                 "Read this real estate purchase contract and extract ONLY the fields described by the JSON schema. "
-                 "Return null when a field is not present. Dates as YYYY-MM-DD if possible."},
-                {"type":"input_file","file_id": file_id}
-            ]
-        }],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": schema_obj["name"],
-                "schema": schema_obj["schema"],
-                "strict": True
-            }
-        },
-        "temperature": 0
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=240)
-    r.raise_for_status()
-    data = r.json()
-    parsed = data.get("output_parsed")
-    if parsed is None:
-        # Fallback if server returns text
-        try:
-            txt = data.get("output",[{}])[0].get("content",[{}])[0].get("text","{}")
-            parsed = json.loads(txt)
-        except Exception:
-            parsed = {}
-    return parsed
+
+    # Chunk missing fields to avoid oversized schemas
+    BATCH = 24
+    merged = {}
+
+    for i in range(0, len(missing_fields), BATCH):
+        batch = missing_fields[i:i+BATCH]
+        schema_obj = make_json_schema_from_subset(batch)
+
+        url = "https://api.openai.com/v1/responses"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        payload = {
+            "model": "gpt-4o-mini",
+            "input": [{
+                "role":"user",
+                "content":[
+                    {"type":"input_text","text":
+                     "Read this real estate purchase contract and extract ONLY the fields described by the JSON schema. "
+                     "Use null when not present. Dates as YYYY-MM-DD if possible."
+                    },
+                    {"type":"input_file","file_id": file_id}
+                ]
+            }],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {                 # <<<<<< key difference
+                        "name":   schema_obj["name"],
+                        "schema": schema_obj["schema"],
+                        "strict": True
+                    }
+                }
+            },
+            "temperature": 0
+        }
+
+        r = requests.post(url, headers=headers, json=payload, timeout=240)
+        if not r.ok:
+            # Log exact server message to Render logs AND surface it to caller
+            try:
+                detail = r.text[:800]
+            except Exception:
+                detail = "<no body>"
+            raise RuntimeError(f"OpenAI API error: {r.status_code} {detail}")
+
+        data = r.json()
+        parsed = data.get("output_parsed")
+        if parsed is None:
+            try:
+                txt = data.get("output",[{}])[0].get("content",[{}])[0].get("text","{}")
+                parsed = json.loads(txt)
+            except Exception:
+                parsed = {}
+
+        # merge per-batch
+        if isinstance(parsed, dict):
+            merged.update(parsed)
+
+    return merged
 
 # -----------------------------------------------------------------------------
 # Rule-based extraction (template-driven)
