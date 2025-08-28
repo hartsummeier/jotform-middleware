@@ -1,18 +1,29 @@
 # app.py
-import os, json, re, hashlib, logging, traceback, requests
+import os, io, re, json, hashlib, logging, traceback, requests
 from datetime import datetime
 from flask import Flask, request, jsonify
 
+# PDF text extraction & fuzzy match
+from pdfminer.high_level import extract_text
+from rapidfuzz import process, fuzz
+
+# -----------------------------------------------------------------------------
+# Environment
+# -----------------------------------------------------------------------------
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
 JOTFORM_API_KEY = os.environ.get("JOTFORM_API_KEY", "")
-INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")
+INTAKE_FORM_ID  = os.environ.get("INTAKE_FORM_ID", "")  # may be overridden by fields.json
 
+# -----------------------------------------------------------------------------
+# App & logging
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ---------- config ----------
+# -----------------------------------------------------------------------------
+# Load fields.json (lightweight, comment-tolerant)
+# -----------------------------------------------------------------------------
 def _strip_json_comments(text: str) -> str:
-    # Remove // line comments and /* block */ comments (basic, good enough for our fields.json)
     text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     return text
@@ -23,14 +34,15 @@ def load_cfg():
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Try again after stripping comments if someone added them
         return json.loads(_strip_json_comments(raw))
 
 CFG = load_cfg()
 if CFG.get("intake_form_id"):
     INTAKE_FORM_ID = CFG["intake_form_id"]
 
-# ---------- jotform helpers ----------
+# -----------------------------------------------------------------------------
+# Jotform helpers
+# -----------------------------------------------------------------------------
 def extract_form_id(value: str) -> str:
     if not value:
         raise RuntimeError("INTAKE_FORM_ID is missing.")
@@ -40,30 +52,30 @@ def extract_form_id(value: str) -> str:
     return m.group(1)
 
 def jf_get_questions(form_id: str) -> dict:
+    """Return dict of question id -> question JSON."""
     if not JOTFORM_API_KEY:
-        raise RuntimeError("JOTFORM_API_KEY env var not set.")
+        raise RuntimeError("JOTFORM_API_KEY is not set.")
     form_id = extract_form_id(form_id)
     url = f"https://api.jotform.com/form/{form_id}/questions?apiKey={JOTFORM_API_KEY}"
     r = requests.get(url, timeout=90)
-    try:
-        r.raise_for_status()
-    except Exception:
-        raise RuntimeError(f"Jotform /questions error: {r.status_code} {r.text[:400]}")
+    r.raise_for_status()
     return r.json()["content"]
 
-def jf_type_to_model_type(jf_type: str, override: dict | None) -> str:
+def jf_type_to_model_type(jf_type: str, override: dict|None) -> str:
     if override and "type" in override:
         return override["type"]
-    t = jf_type or ""
-    if t in ("control_fullname",):                  return "full_name"
-    if t in ("control_address",):                   return "address"
-    if t in ("control_phone",):                     return "phone"
-    if t in ("control_datetime",):                  return "date"
-    if t in ("control_number", "control_spinner"):  return "number"
-    if t in ("control_dropdown", "control_radio"):  return "enum"
+    t = (jf_type or "").lower()
+    if t == "control_fullname":  return "full_name"
+    if t == "control_address":   return "address"
+    if t == "control_phone":     return "phone"
+    if t == "control_datetime":  return "date"
+    if t in ("control_number", "control_spinner"): return "number"
+    if t in ("control_dropdown", "control_radio"): return "enum"
+    if t == "control_checkbox":  return "multi_enum"
     return "string"
 
 def build_live_catalog():
+    """Read Jotform questions and return a list of normalized fields with options."""
     qs = jf_get_questions(INTAKE_FORM_ID)
     exclude_types = set(CFG.get("exclude_types", []))
     overrides = CFG.get("overrides", {})
@@ -73,16 +85,16 @@ def build_live_catalog():
         jf_type = q.get("type") or ""
         if jf_type in exclude_types:
             continue
-        unique = q.get("name") or ""    # Unique Name
+        unique = q.get("name") or ""   # Unique Name
         label  = q.get("text") or unique
         if not unique:
             continue
-
         ov    = overrides.get(unique, {})
         ftype = jf_type_to_model_type(jf_type, ov)
 
+        # collect options for enums/checkbox
         enum = None
-        if ftype == "enum":
+        if ftype in ("enum", "multi_enum"):
             props = q.get("properties") or {}
             opts  = props.get("options")
             if isinstance(opts, str):
@@ -91,34 +103,35 @@ def build_live_catalog():
                 enum = [str(o).strip() for o in opts if str(o).strip()]
 
         fields.append({
-            "key": unique,
-            "qid": str(qid),
-            "label": label,
+            "key": unique,             # Unique Name
+            "qid": str(qid),           # Question ID
+            "label": label,            # Human label
+            "jf_type": jf_type,        # Original Jotform type
             "type": ov.get("type", ftype),
             "enum": ov.get("enum", enum)
         })
     logging.info("Live catalog size: %d", len(fields))
     return fields
 
-# ---------- openai helpers ----------
-def _sanitize_jotform_file_url(u: str) -> str:
-    u = u.strip().strip("<>").strip("\"'")
-    u = re.sub(r'%3E(?=\?|$)', '', u, flags=re.IGNORECASE)
-    u = re.sub(r'>(?=\?|$)', '', u)
-    return u
+# Quick label finder for mapping
+def key_by_label(fields, pattern):
+    rx = re.compile(pattern, re.I)
+    for f in fields:
+        if rx.search(f["label"]):
+            return f["key"]
+    return None
 
+# -----------------------------------------------------------------------------
+# OpenAI helpers
+# -----------------------------------------------------------------------------
 def download_file(url: str):
-    try:
-        clean = _sanitize_jotform_file_url(url)
-        r = requests.get(clean, timeout=120)
-        r.raise_for_status()
-        data = r.content
-        return data, hashlib.sha256(data).hexdigest()
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to download file from URL. If it's a Jotform upload, turn OFF "
-            "'Require log-in to view uploaded files' for testing. Details: %s" % e
-        )
+    clean = url.strip().strip("<>").strip("\"'")
+    clean = re.sub(r'%3E(?=\?|$)', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'>(?=\?|$)', '', clean)
+    r = requests.get(clean, timeout=180)
+    r.raise_for_status()
+    data = r.content
+    return data, hashlib.sha256(data).hexdigest()
 
 def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
     if not OPENAI_API_KEY:
@@ -128,223 +141,348 @@ def openai_upload_file(pdf_bytes: bytes, filename="contract.pdf") -> str:
     files = {"file": (filename, pdf_bytes, "application/pdf")}
     data  = {"purpose": "assistants"}
     r = requests.post(url, headers=headers, files=files, data=data, timeout=180)
-    try:
-        r.raise_for_status()
-    except Exception:
-        raise RuntimeError(f"OpenAI file upload error: {r.status_code} {r.text[:400]}")
+    r.raise_for_status()
     return r.json()["id"]
 
-def make_json_schema_from_fields(fields: list[dict]) -> dict:
+def make_json_schema_from_subset(subset_fields):
+    """Structured Outputs schema for only the still-missing fields."""
     props = {}
-    for f in fields:
-        key = f["key"]; ftype = f.get("type", "string")
-        if ftype == "number":
-            props[key] = {"type": "number", "nullable": True}
-        elif ftype == "date":
-            props[key] = {"type": "string", "nullable": True}
-        elif ftype == "enum":
+    for f in subset_fields:
+        k, t = f["key"], f.get("type","string")
+        if t == "number":
+            props[k] = {"type": "number", "nullable": True}
+        elif t == "date":
+            props[k] = {"type": "string", "nullable": True}
+        elif t == "enum":
             enum = f.get("enum")
-            if enum:
-                props[key] = {"type": "string", "enum": enum, "nullable": True}
-            else:
-                props[key] = {"type": "string", "nullable": True}
-        elif ftype == "full_name":
-            subprops = {
-                "first":  {"type":"string","nullable": True},
-                "last":   {"type":"string","nullable": True},
-                "middle": {"type":"string","nullable": True},
-                "suffix": {"type":"string","nullable": True}
-            }
-            props[key] = {
-                "type": "object",
-                "nullable": True,
-                "properties": subprops,
-                "required": list(subprops.keys()),           # <-- add this
-                "additionalProperties": False
-            }
-        elif ftype == "address":
-            subprops = {
-                "line1":   {"type":"string","nullable": True},
-                "line2":   {"type":"string","nullable": True},
-                "city":    {"type":"string","nullable": True},
-                "state":   {"type":"string","nullable": True},
-                "postal":  {"type":"string","nullable": True},
-                "country": {"type":"string","nullable": True}
-            }
-            props[key] = {
-                "type": "object",
-                "nullable": True,
-                "properties": subprops,
-                "required": list(subprops.keys()),           # <-- add this
-                "additionalProperties": False
-            }
-        elif ftype == "phone":
-            subprops = {
-                "full":   {"type":"string","nullable": True},
-                "area":   {"type":"string","nullable": True},
-                "number": {"type":"string","nullable": True}
-            }
-            props[key] = {
-                "type": "object",
-                "nullable": True,
-                "properties": subprops,
-                "required": list(subprops.keys()),           # <-- add this
-                "additionalProperties": False
-            }
+            props[k] = {"type":"string","enum": enum, "nullable": True} if enum else {"type":"string","nullable": True}
+        elif t == "multi_enum":
+            enum = f.get("enum") or []
+            props[k] = {"type":"array","items":{"type":"string","enum": enum}, "nullable": True}
+        elif t == "full_name":
+            props[k] = {"type":"object","nullable":True,"properties":{
+                "first":{"type":"string","nullable":True},
+                "last":{"type":"string","nullable":True},
+                "middle":{"type":"string","nullable":True},
+                "suffix":{"type":"string","nullable":True}
+            }, "additionalProperties": False}
+        elif t == "address":
+            props[k] = {"type":"object","nullable":True,"properties":{
+                "line1":{"type":"string","nullable":True},
+                "line2":{"type":"string","nullable":True},
+                "city":{"type":"string","nullable":True},
+                "state":{"type":"string","nullable":True},
+                "postal":{"type":"string","nullable":True},
+                "country":{"type":"string","nullable":True}
+            }, "additionalProperties": False}
+        elif t == "phone":
+            props[k] = {"type":"object","nullable":True,"properties":{
+                "full":{"type":"string","nullable":True},
+                "area":{"type":"string","nullable":True},
+                "number":{"type":"string","nullable":True}
+            }, "additionalProperties": False}
         else:
-            props[key] = {"type": "string", "nullable": True}
-
-    # meta from model
-    props["confidence"] = {"type":"number","minimum":0,"maximum":1,"nullable": True}
-    props["page_refs"]  = {"type":"array","items":{"type":"integer"}, "nullable": True}
-
+            props[k] = {"type": "string", "nullable": True}
     return {
-        "name": "intake_extract",
-        "schema": {
-            "type":"object",
-            "properties": props,
-            "required": list(props.keys()),
-            "additionalProperties": False
-        },
+        "name": "intake_extract_subset",
+        "schema": {"type":"object","properties": props, "required": list(props.keys()), "additionalProperties": False},
         "strict": True
     }
 
-def extract_with_openai(pdf_bytes: bytes, schema_obj: dict) -> dict:
+def llm_extract_missing(pdf_bytes: bytes, missing_fields):
+    """Ask the model only for what is still missing."""
+    if not missing_fields:
+        return {}
     file_id = openai_upload_file(pdf_bytes)
+    schema_obj = make_json_schema_from_subset(missing_fields)
     url = "https://api.openai.com/v1/responses"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-
-    format_block = {"type": "json_schema", **schema_obj}  # << add type here
-
     payload = {
         "model": "gpt-4o-mini",
         "input": [{
-            "role": "user",
-            "content": [
+            "role":"user",
+            "content":[
                 {"type":"input_text","text":
-                 "Read this real estate purchase contract (and addenda). "
-                 "Extract values that match the schema keys. "
-                 "Use null when not present. Format dates as YYYY-MM-DD. "
-                 "For names/addresses/phones, fill sub-fields if available. "
-                 "Also return page_refs (page numbers) and an overall confidence 0-1."},
+                 "Read this real estate purchase contract and extract ONLY the fields described by the JSON schema. "
+                 "Return null when a field is not present. Dates as YYYY-MM-DD if possible."},
                 {"type":"input_file","file_id": file_id}
             ]
         }],
-        "text": { "format": format_block },  # <-- now includes 'type'
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": schema_obj["name"],
+                "schema": schema_obj["schema"],
+                "strict": True
+            }
+        },
         "temperature": 0
     }
     r = requests.post(url, headers=headers, json=payload, timeout=240)
-    try:
-        r.raise_for_status()
-    except Exception:
-        raise RuntimeError(f"OpenAI API error: {r.status_code} {r.text[:500]}")
+    r.raise_for_status()
     data = r.json()
     parsed = data.get("output_parsed")
-    if not parsed:
+    if parsed is None:
+        # Fallback if server returns text
         try:
-            text_piece = (
-                data.get("output", [{}])[0]
-                    .get("content", [{}])[0]
-                    .get("text", "{}")
-            )
-            parsed = json.loads(text_piece)
+            txt = data.get("output",[{}])[0].get("content",[{}])[0].get("text","{}")
+            parsed = json.loads(txt)
         except Exception:
             parsed = {}
     return parsed
 
-# ---------- submission helpers ----------
-def put_field(payload: dict, qid: str, value, subkey: str | None = None):
-    payload[f"submission[{qid}][{subkey}]" if subkey else f"submission[{qid}]"] = value
+# -----------------------------------------------------------------------------
+# Rule-based extraction (template-driven)
+# -----------------------------------------------------------------------------
+def pdf_to_text(pdf_bytes: bytes) -> str:
+    with io.BytesIO(pdf_bytes) as f:
+        return extract_text(f) or ""
 
-def parse_date_yyyy_mm_dd(s: str):
+NUM_RE = r"(?:(?:\$?\s*)?([0-9][0-9,\.]*))"
+DATE_RE = r"([A-Za-z]{3,9}\s+\d{1,2},\s*\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})"
+
+def find_one(rx, text, flags=re.I):
+    m = re.search(rx, text, flags)
+    return (m.group(1).strip() if m else None)
+
+def to_number(val):
+    if val is None: return None
+    if isinstance(val, (int, float)): return val
+    if isinstance(val, str):
+        s = re.sub(r"[^\d\.-]", "", val)
+        try:
+            n = float(s)
+            return int(n) if n.is_integer() else n
+        except Exception:
+            return None
+    return None
+
+def parse_date_parts(s: str):
     if not s or not isinstance(s, str): return None
     s = s.strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y"):
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%b %d, %Y", "%B %d, %Y", "%Y/%m/%d"):
         try:
             dt = datetime.strptime(s, fmt)
             return dt.month, dt.day, dt.year
-        except Exception:
-            pass
-    m = re.findall(r"\d+", s)
-    if len(m) == 3:
-        a, b, c = [int(x) for x in m]
-        if len(m[0]) == 4: return b, c, a
-        if len(m[-1]) == 4: return a, b, c
+        except: pass
+    nums = re.findall(r"\d+", s)
+    if len(nums) == 3:
+        a,b,c = [int(x) for x in nums]
+        if len(nums[0]) == 4: return b,c,a
+        if len(nums[-1]) == 4: return a,b,c
     return None
 
-def jotform_create_submission(form_id: str, fields: list[dict], extracted: dict,
-                              file_hash: str, fub_id: str | None = None) -> str:
+def choose_option(value: str, options: list[str]) -> str|None:
+    """Pick the closest label from options for a single-select enum."""
+    if not value or not options: return None
+    # normalize common synonyms
+    v = value.strip().lower()
+    synonyms = {
+        "lb": "listing brokerage",
+        "listing broker": "listing brokerage",
+        "sb": "selling brokerage",
+        "title": "title company",
+        "cash purchase": "cash",
+        "conv": "conventional",
+        "insured conv": "insured conventional",
+        "yes": "yes", "no": "no"
+    }
+    v = synonyms.get(v, v)
+    best, score, _ = process.extractOne(v, options, scorer=fuzz.token_sort_ratio)
+    return best if score >= 70 else None
+
+def rule_extract(text: str) -> dict:
+    """
+    Pull the obvious fields by pattern.
+    Tuned for your Purchase Agreement template family.
+    """
+    out = {}
+
+    # Purchase Price
+    # e.g., "Purchase Price: $330,000.00" or "PURCHASE PRICE $330,000"
+    price = find_one(r"purchase\s+price[:\s]*" + NUM_RE, text)
+    out["purchase_price"] = to_number(price)
+
+    # Earnest Money amount
+    em = find_one(r"earnest\s+money[^.\n]*" + NUM_RE, text)
+    out["earnest_money"] = to_number(em)
+
+    # Earnest Money due date (if present as a date)
+    em_due = find_one(r"earnest\s+money[^.\n]*(?:due|delivered|deposit)[^.\n]*" + DATE_RE, text)
+    out["earnest_due"] = em_due
+
+    # Earnest Money holder
+    em_holder = find_one(r"(?:held\s+by|deposited\s+with)\s+([A-Za-z ]+?)(?:\.|\n|,)", text)
+    if em_holder:
+        out["earnest_holder"] = em_holder
+
+    # Property Address (simple pass: first address-like line)
+    addr_line = find_one(r"(?i)(?:property\s+address|address)[:\s]*([^\n]+)\n", text)
+    if addr_line:
+        out["property_line1"] = addr_line
+
+    # Method of Payment (Cash / Conventional / FHA / VA / etc.)
+    mop = find_one(r"(?:method\s+of\s+payment|type\s+of\s+financing)[:\s]*([A-Za-z ]+)", text)
+    if mop:
+        out["method_of_payment"] = mop
+
+    # Appraisal (common check on cash deals)
+    app = find_one(r"(?:appraisal)[^.\n]*(yes|no)\b", text)
+    if app:
+        out["appraisal_cash"] = app
+
+    return out
+
+# -----------------------------------------------------------------------------
+# Submission helpers (supports arrays for checkboxes)
+# -----------------------------------------------------------------------------
+def put_item(items, qid: str, value, subkey: str|None = None, is_array: bool = False):
+    if value is None: return
+    if is_array:
+        items.append((f"submission[{qid}][]", value))
+    else:
+        if subkey:
+            items.append((f"submission[{qid}][{subkey}]", value))
+        else:
+            items.append((f"submission[{qid}]", value))
+
+def submit_to_jotform(form_id: str, fields: list[dict], extracted: dict,
+                      file_hash: str, fub_id: str|None = None) -> str:
     form_id = extract_form_id(form_id)
     url = f"https://api.jotform.com/form/{form_id}/submissions?apiKey={JOTFORM_API_KEY}"
-    payload = {}
 
-    # Optional metadata sink — point this to a long text QID if you create one.
+    items: list[tuple[str,str]] = []
+
+    # (optional) metadata sink if you later add a Long Text field for debugging
     # meta_qid = None
-    meta = {
-        "overall": extracted.get("confidence"),
-        "page_refs": extracted.get("page_refs"),
-        "source_file_hash": file_hash,
-        "fub_id": fub_id
-    }
-    # if meta_qid: put_field(payload, meta_qid, json.dumps(meta))
+    meta = {"source_file_hash": file_hash, "fub_id": fub_id}
+    # if meta_qid: put_item(items, meta_qid, json.dumps(meta))
 
-    for f in fields:
-        key, qid, ftyp = f["key"], f["qid"], f.get("type", "string")
-        val = extracted.get(key, None)
-        if val in (None, ""): continue
+    # Build a quick lookup of key -> field spec
+    field_by_key = {f["key"]: f for f in fields}
+
+    for key, val in extracted.items():
+        spec = field_by_key.get(key)
+        if not spec or val in (None, ""):
+            continue
+        qid  = spec["qid"]
+        ftyp = spec.get("type", "string")
 
         if ftyp == "full_name" and isinstance(val, dict):
-            if val.get("first"):  put_field(payload, qid, val["first"],  "first")
-            if val.get("last"):   put_field(payload, qid, val["last"],   "last")
-            if val.get("middle"): put_field(payload, qid, val["middle"], "middle")
-            if val.get("suffix"): put_field(payload, qid, val["suffix"], "suffix")
+            for sub in ("first","last","middle","suffix"):
+                if val.get(sub): put_item(items, qid, val[sub], sub)
         elif ftyp == "address" and isinstance(val, dict):
-            if val.get("line1"):   put_field(payload, qid, val["line1"],   "addr_line1")
-            if val.get("line2"):   put_field(payload, qid, val["line2"],   "addr_line2")
-            if val.get("city"):    put_field(payload, qid, val["city"],    "city")
-            if val.get("state"):   put_field(payload, qid, val["state"],   "state")
-            if val.get("postal"):  put_field(payload, qid, val["postal"],  "postal")
-            if val.get("country"): put_field(payload, qid, val["country"], "country")
+            m = {
+                "line1":"addr_line1","line2":"addr_line2",
+                "city":"city","state":"state","postal":"postal","country":"country"
+            }
+            for sub, jf_sub in m.items():
+                if val.get(sub): put_item(items, qid, val[sub], jf_sub)
         elif ftyp == "phone" and isinstance(val, dict):
-            if val.get("full"): put_field(payload, qid, val["full"], "full")
+            if val.get("full"): put_item(items, qid, val["full"], "full")
             else:
-                if val.get("area"):   put_field(payload, qid, val["area"],   "area")
-                if val.get("number"): put_field(payload, qid, val["number"], "phone")
+                if val.get("area"):   put_item(items, qid, val["area"], "area")
+                if val.get("number"): put_item(items, qid, val["number"], "phone")
         elif ftyp == "date":
             if isinstance(val, dict):
-                m, d, y = val.get("month"), val.get("day"), val.get("year")
+                m,d,y = val.get("month"), val.get("day"), val.get("year")
                 if m and d and y:
-                    put_field(payload, qid, m, "month")
-                    put_field(payload, qid, d, "day")
-                    put_field(payload, qid, y, "year")
-                elif val.get("raw"):
-                    comp = parse_date_yyyy_mm_dd(val["raw"])
-                    if comp:
-                        m, d, y = comp
-                        put_field(payload, qid, m, "month")
-                        put_field(payload, qid, d, "day")
-                        put_field(payload, qid, y, "year")
+                    put_item(items, qid, m, "month")
+                    put_item(items, qid, d, "day")
+                    put_item(items, qid, y, "year")
             elif isinstance(val, str):
-                comp = parse_date_yyyy_mm_dd(val)
+                comp = parse_date_parts(val)
                 if comp:
-                    m, d, y = comp
-                    put_field(payload, qid, m, "month")
-                    put_field(payload, qid, d, "day")
-                    put_field(payload, qid, y, "year")
+                    m,d,y = comp
+                    put_item(items, qid, m, "month")
+                    put_item(items, qid, d, "day")
+                    put_item(items, qid, y, "year")
+        elif ftyp == "number":
+            n = to_number(val)
+            if n is not None:
+                put_item(items, qid, n)
+        elif ftyp == "multi_enum":
+            if isinstance(val, list):
+                for opt in val:
+                    put_item(items, qid, opt, is_array=True)
         else:
-            put_field(payload, qid, val)
+            put_item(items, qid, val)
 
-    r = requests.post(url, data=payload, timeout=120)
-    try:
-        r.raise_for_status()
-    except Exception:
-        raise RuntimeError(f"Jotform API error: {r.status_code} {r.text[:400]}")
+    r = requests.post(url, data=items, timeout=180)
+    r.raise_for_status()
     return r.json()["content"]["submissionID"]
 
-def jotform_edit_link(submission_id: str) -> str:
-    return f"https://www.jotform.com/edit/{submission_id}"
+# -----------------------------------------------------------------------------
+# Hybrid extraction orchestrator
+# -----------------------------------------------------------------------------
+def map_rule_results_to_keys(rule_out: dict, fields: list[dict]) -> dict:
+    """
+    Convert domain results (purchase_price, earnest_money, ...) into
+    {<unique_name>: value} using label lookup so you don't have to maintain keys.
+    """
+    out = {}
 
-# ---------- routes ----------
+    # Locate keys by label text
+    k_price   = key_by_label(fields, r"what\s+is\s+the\s+purchase\s+price")
+    k_em_amt  = key_by_label(fields, r"how\s+much\s+is\s+the\s+earnest\s+money")
+    k_em_due  = key_by_label(fields, r"when\s+is\s+the\s+earnest\s+money\s+due")
+    k_em_hold = key_by_label(fields, r"who\s+is\s+holding\s+earnest\s+money")
+    k_addr    = key_by_label(fields, r"address$")
+    k_mop     = key_by_label(fields, r"method\s+of\s+payment")
+    k_app     = key_by_label(fields, r"will\s+buyer\s+have\s+an\s+appraisal")
+
+    # Numbers & dates
+    if rule_out.get("purchase_price") is not None and k_price:
+        out[k_price] = rule_out["purchase_price"]
+    if rule_out.get("earnest_money") is not None and k_em_amt:
+        out[k_em_amt] = rule_out["earnest_money"]
+    if rule_out.get("earnest_due") and k_em_due:
+        out[k_em_due] = rule_out["earnest_due"]
+
+    # Address (simple best-effort single-line -> line1)
+    if rule_out.get("property_line1") and k_addr:
+        out[k_addr] = {
+            "line1": rule_out["property_line1"],
+            "line2": None, "city": None, "state": None, "postal": None, "country": None
+        }
+
+    # Single-select enums: choose the nearest real option
+    def choose_for_key(k, val):
+        if not k or not val: return
+        spec = next((f for f in fields if f["key"] == k), None)
+        best = choose_option(str(val), spec.get("enum", [])) if spec else None
+        if best: out[k] = best
+
+    choose_for_key(k_em_hold, rule_out.get("earnest_holder"))
+    choose_for_key(k_mop,     rule_out.get("method_of_payment"))
+    choose_for_key(k_app,     rule_out.get("appraisal_cash"))
+
+    return out
+
+def hybrid_extract(pdf_bytes: bytes, fields: list[dict]) -> dict:
+    """
+    1) Parse PDF text with regex anchors (fast, deterministic).
+    2) Ask the LLM only for fields still missing.
+    """
+    text = pdf_to_text(pdf_bytes)
+    primary = map_rule_results_to_keys(rule_extract(text), fields)
+
+    # figure out what's still missing (and worth asking the model)
+    keyed = {f["key"] for f in fields}
+    still_missing = []
+    for f in fields:
+        if f["key"] not in primary and f.get("type") in ("number","date","enum","multi_enum","address","full_name","phone","string"):
+            still_missing.append(f)
+
+    llm_extra = llm_extract_missing(pdf_bytes, still_missing)
+    # merge (rule-based wins)
+    merged = dict(llm_extra)
+    merged.update(primary)
+    return merged
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
 @app.route("/", methods=["GET", "HEAD"])
 def health():
     return "Middleware is running.", 200
@@ -362,18 +500,23 @@ def ingest():
         agent_email = body.get("agent_email", "")
         uploaded_by = body.get("uploaded_by", "")
         file_url    = body.get("file_url", "")
+        debug       = body.get("debug", False)
+
         if not file_url:
             return jsonify({"ok": False, "error": "file_url is required"}), 400
 
         pdf_bytes, file_hash = download_file(file_url)
-        fields     = build_live_catalog()
-        schema_obj = make_json_schema_from_fields(fields)
-        extracted  = extract_with_openai(pdf_bytes, schema_obj)
+        fields = build_live_catalog()
 
-        submission_id = jotform_create_submission(
+        extracted = hybrid_extract(pdf_bytes, fields)
+
+        if debug:
+            return jsonify({"ok": True, "mode": "debug", "extracted": extracted})
+
+        submission_id = submit_to_jotform(
             INTAKE_FORM_ID, fields, extracted, file_hash, fub_id
         )
-        edit_url = jotform_edit_link(submission_id)
+        edit_url = f"https://www.jotform.com/edit/{submission_id}"
 
         return jsonify({
             "ok": True,
@@ -383,10 +526,14 @@ def ingest():
             "agent_email": agent_email,
             "uploaded_by": uploaded_by
         })
+
     except Exception as e:
         logging.error("ingest error: %s\n%s", e, traceback.format_exc())
         return jsonify({"ok": False, "error": str(e)}), 400
 
+# -----------------------------------------------------------------------------
+# Entrypoint
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
